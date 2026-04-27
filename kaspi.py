@@ -1,17 +1,17 @@
 """
 kaspi.py — парсер позиций Kaspi.
-Товары в HTML содержат атрибут data-product-id — это и есть артикул.
 """
 
 import httpx
 import logging
+import html
 from bs4 import BeautifulSoup
 
 logger = logging.getLogger(__name__)
 
-CITY_ID = "750000000"   # Алматы
-MAX_PAGES = 84           # ищем до топ-1008 (как оригинальный бот)
-ITEMS_PER_PAGE = 12      # товаров на странице
+CITY_ID = "750000000"
+MAX_PAGES = 84
+ITEMS_PER_PAGE = 12
 
 HEADERS = {
     "User-Agent": (
@@ -33,7 +33,6 @@ async def get_product_name(code: str) -> str | None:
             resp = await client.get(url)
             if resp.status_code == 200:
                 soup = BeautifulSoup(resp.text, "html.parser")
-                # Пробуем найти заголовок товара
                 title = (
                     soup.find("h1", {"class": lambda c: c and "title" in c})
                     or soup.find("h1")
@@ -41,24 +40,49 @@ async def get_product_name(code: str) -> str | None:
                 )
                 if title:
                     if title.name == "meta":
-                        return title.get("content", "").strip()
-                    return title.get_text(strip=True)
+                        name = title.get("content", "").strip()
+                    else:
+                        name = title.get_text(strip=True)
+                    # Декодируем HTML entities: &#43; → +, &amp; → &
+                    return html.unescape(name)
     except Exception as e:
         logger.error(f"get_product_name({code}): {e}")
     return None
 
 
-def make_search_query(name: str) -> str:
-    """Берём первые 4 слова из названия для поискового запроса."""
+def make_queries(name: str) -> list[str]:
+    """
+    Генерируем несколько вариантов поискового запроса.
+    Пробуем от короткого к длинному — разные варианты дают разную выдачу.
+    """
     words = name.strip().split()
-    return " ".join(words[:4])
+    queries = []
+
+    # Вариант 1: бренд + тип товара (первые 2 слова)
+    if len(words) >= 2:
+        queries.append(" ".join(words[:2]))
+
+    # Вариант 2: первые 3 слова
+    if len(words) >= 3:
+        queries.append(" ".join(words[:3]))
+
+    # Вариант 3: первые 4 слова
+    if len(words) >= 4:
+        queries.append(" ".join(words[:4]))
+
+    # Убираем дубли сохраняя порядок
+    seen = set()
+    result = []
+    for q in queries:
+        if q not in seen:
+            seen.add(q)
+            result.append(q)
+
+    return result
 
 
 async def get_page_product_ids(query: str, page: int) -> list[str]:
-    """
-    Загружает страницу поиска Kaspi и возвращает список артикулов.
-    Артикулы находятся в атрибуте data-product-id карточек товаров.
-    """
+    """Загружает страницу поиска и возвращает список артикулов."""
     url = "https://kaspi.kz/shop/search/"
     params = {
         "text": query,
@@ -78,37 +102,43 @@ async def get_page_product_ids(query: str, page: int) -> list[str]:
             soup = BeautifulSoup(resp.text, "html.parser")
             cards = soup.find_all(attrs={"data-product-id": True})
             ids = [card.get("data-product-id", "") for card in cards if card.get("data-product-id")]
-            logger.info(f"Страница {page}: найдено {len(ids)} товаров")
+            logger.info(f"Запрос '{query}' страница {page}: {len(ids)} товаров")
             return ids
 
     except Exception as e:
-        logger.error(f"get_page_product_ids page {page}: {e}")
+        logger.error(f"get_page_product_ids('{query}', {page}): {e}")
         return []
 
 
-async def find_position(code: str, query: str) -> dict | None:
-    """Перебирает страницы поиска пока не найдёт нужный артикул."""
-    for page in range(MAX_PAGES):
-        ids = await get_page_product_ids(query, page)
+async def find_position(code: str, queries: list[str]) -> dict | None:
+    """
+    Пробуем каждый запрос по очереди.
+    Для каждого запроса перебираем страницы.
+    """
+    for query in queries:
+        logger.info(f"Пробую запрос: '{query}'")
+        for page in range(MAX_PAGES):
+            ids = await get_page_product_ids(query, page)
 
-        if not ids:
-            logger.info(f"Пустая страница {page}, прекращаем поиск")
-            break
+            if not ids:
+                logger.info(f"Пустая страница {page} для '{query}', следующий запрос")
+                break
 
-        for idx, item_id in enumerate(ids):
-            if str(item_id) == str(code):
-                absolute = page * ITEMS_PER_PAGE + idx + 1
-                return {
-                    "position": absolute,
-                    "page": page + 1,
-                    "place_on_page": idx + 1,
-                }
+            for idx, item_id in enumerate(ids):
+                if str(item_id) == str(code):
+                    absolute = page * ITEMS_PER_PAGE + idx + 1
+                    return {
+                        "position": absolute,
+                        "page": page + 1,
+                        "place_on_page": idx + 1,
+                        "query": query,
+                    }
 
     return None
 
 
 async def check_code(code: str) -> dict:
-    """Полная проверка одного артикула — название + позиция."""
+    """Полная проверка одного артикула."""
     result = {
         "code": code,
         "name": None,
@@ -123,12 +153,15 @@ async def check_code(code: str) -> dict:
         return result
 
     result["name"] = name
-    query = make_search_query(name)
-    logger.info(f"Ищу '{code}' по запросу '{query}'")
+    queries = make_queries(name)
+    logger.info(f"Код {code}: '{name}' → запросы: {queries}")
 
-    pos = await find_position(code, query)
+    pos = await find_position(code, queries)
     if pos:
         result.update(pos)
         result["found"] = True
+        logger.info(f"Найден {code} → #{pos['position']} по запросу '{pos['query']}'")
+    else:
+        logger.info(f"Не найден в топ-{MAX_PAGES * ITEMS_PER_PAGE}: {code}")
 
     return result
